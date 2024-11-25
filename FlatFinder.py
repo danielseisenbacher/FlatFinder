@@ -248,7 +248,12 @@ class FlatFinder:
                 data[key]["OUTPUT"] = QgsRasterLayer(rlayer["OUTPUT"], key)
                 data[key]["WEIGHT"] = data[key]["slider"].value()
 
-            calculate_index(data)
+            normalize_results_bool = self.dlg.checkBox.isChecked()
+            rlayer = calculate_index(data, normalize_results_bool)
+
+            # make the layer stylish ;)
+            style_path = os.path.join(self.plugin_dir, "result_style.qml")
+            set_style(rlayer["OUTPUT"], style_path)
             print("FlatFinder finished...")
             print("---------------------------------------")
 
@@ -332,7 +337,6 @@ def reproject_extent(extent):
         "ur_lon": max_point.x(),
         "ur_lat": max_point.y()
     }
-    print(extent_dict)
     return extent_dict
 
 def reproject_vlayer(vlayer):
@@ -395,18 +399,17 @@ def normalize_rlayer(rlayer, type_):
     max_value = stats.maximumValue
 
     # build normalization expression
-    expression = f'100/{max_value}*"{type_}@1"'
-    print(expression)
+    expression = f'100 - (100/{max_value}*"{type_}@1")'
 
     # normalize raster
     rlayer = processing.run("native:rastercalc", {
         'LAYERS': [rlayer],
-        'EXPRESSION': f'100/{max_value}*"{type_}@1"', 'EXTENT': None, 'CELL_SIZE': None, 'CRS': None,
+        'EXPRESSION': expression, 'EXTENT': None, 'CELL_SIZE': None, 'CRS': None,
         'OUTPUT': 'TEMPORARY_OUTPUT'})
 
     return rlayer
 
-def calculate_index(data):
+def calculate_index(data, normalize_results_bool):
     import processing
     print("start calculating the index ...")
 
@@ -415,12 +418,45 @@ def calculate_index(data):
     for key, value in data.items():
         new_string = f'"{key}@1"*({value["WEIGHT"]}/100)+'
         base_string += new_string
-    expr_string = base_string[:-1] + ')'+'/4'
-    print(expr_string)
-    # Todo max value is only 25
+    expr_string = base_string[:-1] + ')'
 
-    processing.runAndLoadResults("native:rastercalc", {
-        'LAYERS': [value["OUTPUT"] for value in data.values()],
-        'EXPRESSION': expr_string,
-        'EXTENT': None, 'CELL_SIZE': None, 'CRS': None, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+    if not normalize_results_bool:
+        # Display directly if no normalization has been chosen
+        rlayer = processing.runAndLoadResults("native:rastercalc", {
+            'LAYERS': [value["OUTPUT"] for value in data.values()],
+            'EXPRESSION': expr_string,
+            'EXTENT': None, 'CELL_SIZE': None, 'CRS': None, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+
+    else:
+
+        # don't display if normalization has been chosen
+        rlayer = processing.run("native:rastercalc", {
+            'LAYERS': [value["OUTPUT"] for value in data.values()],
+            'EXPRESSION': expr_string,
+            'EXTENT': None, 'CELL_SIZE': None, 'CRS': None, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+
+        # get the max value for normalization
+        rlayer = QgsRasterLayer(rlayer["OUTPUT"], "unnormalized raster")
+        provider = rlayer.dataProvider()
+
+        # get statistics for band 1
+        band = 1
+        stats = provider.bandStatistics(band, QgsRasterBandStats.All)
+        max_value = stats.maximumValue
+        min_value = stats.minimumValue
+
+        # build normalization expression
+        expression = f'("unnormalized raster@1"-{min_value})/({max_value}-{min_value})*100'
+
+        rlayer = processing.runAndLoadResults("native:rastercalc", {'LAYERS': [rlayer],
+                                             'EXPRESSION': expression, 'EXTENT': None,
+                                             'CELL_SIZE': None, 'CRS': None, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+
+    return rlayer
+
+def set_style(rlayer, style_path):
+    import processing
+    processing.run("native:setlayerstyle", {
+        'INPUT': rlayer,
+        'STYLE': style_path})
     pass
