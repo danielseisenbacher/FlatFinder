@@ -26,7 +26,7 @@ import sys
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
-from qgis.core import QgsVectorLayer, QgsProject
+from qgis.core import QgsVectorLayer, QgsProject, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRasterBandStats, QgsRasterLayer
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -205,33 +205,52 @@ class FlatFinder:
                 "educationLayer": {"combobox": self.dlg.qgsMapLayerComboBox_2, "slider": self.dlg.slider2},
             }
 
+            # get the raster size metric
+            pixel_size = self.dlg.spinBox.value()
+
             # get current extent
             if self.dlg.mMapLayerComboBox.currentLayer() is None:
                 extent = self.iface.mapCanvas().extent()
             else:
                 extent = self.dlg.mMapLayerComboBox.currentLayer().extent()
 
+            # reproject the extent coordinates if not epsg 4326
+            extent_dict = reproject_extent(extent)
+
             # download OSM data based on extent
             for key, value in data.items():
                 current_layer = value['combobox'].currentLayer()
-                extent_dict =  {
-                    "ll_lon": extent.xMinimum(),
-                    "ll_lat": extent.yMinimum(),
-                    "ur_lon": extent.xMaximum(),
-                    "ur_lat": extent.yMaximum()
-                }
-                # print(extent_dict)
-                # print(extent)
+
                 if current_layer is None:
+                    # get osm Features
                     vlayer = get_osm_features(
                         layer=key,
                         extent_string=f"{extent_dict["ll_lat"]},{extent_dict["ll_lon"]},{extent_dict["ur_lat"]},{extent_dict["ur_lon"]}"
                     )
+                else:
+                    vlayer = current_layer
+
+                # assure all layers use pseudomercator (epsg: 3857)
+                if vlayer.crs().authid() != 'EPSG:3857':
+                    vlayer = reproject_vlayer(vlayer)
 
 
-                    pass
+                # rasterize for the nearest neighbour analysis
+                rlayer = rasterize_vlayer(vlayer["OUTPUT"], pixel_size, extent_dict)
 
+                if key == "leisureLayer" and current_layer is None:
+                    rlayer = sieve_raster(rlayer["OUTPUT"], pixel_size)
 
+                rlayer = nearest_neighbour(rlayer["OUTPUT"])
+                rlayer = normalize_rlayer(rlayer["OUTPUT"], type_=key)
+
+                # add final things to the dict - the output path of the normalized raster and the weight
+                data[key]["OUTPUT"] = QgsRasterLayer(rlayer["OUTPUT"], key)
+                data[key]["WEIGHT"] = data[key]["slider"].value()
+
+            calculate_index(data)
+            print("FlatFinder finished...")
+            print("---------------------------------------")
 
 
 def get_osm_features(layer, extent_string):
@@ -246,7 +265,7 @@ def get_osm_features(layer, extent_string):
 
         # Load the data as a vector layer
         data_source = f"{osm_output}|layername=multipolygons"
-        vlayer = QgsVectorLayer(data_source, "multipolygons", "ogr")
+        vlayer = QgsVectorLayer(data_source, "leisure", "ogr")
 
     elif layer == "educationLayer":
         # run the file downloader for the educationLayer, with the specified QUICKOSM query
@@ -257,9 +276,10 @@ def get_osm_features(layer, extent_string):
 
         # Load the data as a vector layer
         data_source = f"{osm_output}|layername=points"
-        vlayer = QgsVectorLayer(data_source, "points", "ogr")
+        vlayer = QgsVectorLayer(data_source, "education", "ogr")
 
     elif layer == "publictransportLayer":
+        # Todo: Improve query
         # run the file downloader for the publictransportLayer, with the specified QUICKOSM query
         osm_output = processing.run("native:filedownloader", {
             'URL': f"https://overpass-api.de/api/interpreter?data=[out:xml] [timeout:25];%0A(%0A node[%22public_transport%22%3D%22station%22]( {extent_string});%0A node[%22amenity%22%3D%22bus_station%22]( {extent_string});%0A way[%22public_transport%22%3D%22station%22]( {extent_string});%0A way[%22amenity%22%3D%22bus_station%22]( {extent_string});%0A relation[%22public_transport%22%3D%22station%22]( {extent_string});%0A relation[%22amenity%22%3D%22bus_station%22]( {extent_string});%0A);%0A(._;%3E;);%0Aout body;&info=QgisQuickOSMPlugin",
@@ -268,7 +288,7 @@ def get_osm_features(layer, extent_string):
 
         # Load the data as a vector layer
         data_source = f"{osm_output}|layername=points"
-        vlayer = QgsVectorLayer(data_source, "points", "ogr")
+        vlayer = QgsVectorLayer(data_source, "publictransportation", "ogr")
 
     elif layer == "socialLayer":
         # run the file downloader for the socialLayer, with the specified QUICKOSM query
@@ -279,7 +299,7 @@ def get_osm_features(layer, extent_string):
 
         # Load the data as a vector layer
         data_source = f"{osm_output}|layername=points"
-        vlayer = QgsVectorLayer(data_source, "points", "ogr")
+        vlayer = QgsVectorLayer(data_source, "social", "ogr")
 
     else:
         print("ERROR - layer not found")
@@ -287,26 +307,120 @@ def get_osm_features(layer, extent_string):
     # check validity
     if not vlayer.isValid():
         print("Layer failed to load!")
-        QgsProject.instance().addMapLayer(vlayer)
     else:
-        print("success")
+        QgsProject.instance().addMapLayer(vlayer)
+    return vlayer
+
+def reproject_extent(extent):
+    # Get the source CRS
+    source_crs = QgsProject.instance().crs()
+    if hasattr(extent, 'sourceCrs'):
+        source_crs = extent.sourceCrs
+
+    # Define the target CRS (EPSG:4326)
+    target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+    transform = QgsCoordinateTransform(source_crs, target_crs, QgsProject.instance())
+
+    # Transform the extent coordinates
+    min_point = transform.transform(extent.xMinimum(), extent.yMinimum())
+    max_point = transform.transform(extent.xMaximum(), extent.yMaximum())
+
+    # Return the reprojected extent as a dictionary
+    extent_dict = {
+        "ll_lon": min_point.x(),
+        "ll_lat": min_point.y(),
+        "ur_lon": max_point.x(),
+        "ur_lat": max_point.y()
+    }
+    print(extent_dict)
+    return extent_dict
+
+def reproject_vlayer(vlayer):
+    import processing
+
+    # reproject the layer to pseudo-mercator
+    vlayer = processing.run("native:reprojectlayer", {
+        'INPUT': vlayer,
+        'TARGET_CRS': QgsCoordinateReferenceSystem('EPSG:3857'), 'CONVERT_CURVED_GEOMETRIES': False,
+        'OPERATION': '+proj=pipeline +step +proj=unitconvert +xy_in=deg +xy_out=rad +step +proj=webmerc +lat_0=0 +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84',
+        'OUTPUT': 'TEMPORARY_OUTPUT'})
 
     return vlayer
 
-"""
-for parks: 
-MULTI TO SINGLEPART
-processing.run("native:multiparttosingleparts", {'INPUT':'C:/Users/seise/AppData/Local/Temp/processing_ErCEMK/6194a798fcf14964bb7c0a282ab6ef1b/OUTPUT.file|layername=multipolygons','OUTPUT':'TEMPORARY_OUTPUT'})
+def rasterize_vlayer(vlayer, pixel_size, extent_dict):
+    import processing
 
-FIX GEOMETRY
-processing.run("native:fixgeometries", {'INPUT':'memory://Polygon?crs=EPSG:4326&field=osm_id:string(0,0)&field=osm_way_id:string(0,0)&field=osm_version:integer(0,0)&field=osm_timestamp:datetime(0,0)&field=osm_uid:integer(0,0)&field=osm_user:string(0,0)&field=osm_changeset:integer(0,0)&field=other_tags:string(0,0)&uid={f78ee244-ad76-4086-a9b3-d774d9b9b4ab}','METHOD':1,'OUTPUT':'TEMPORARY_OUTPUT'})
+    # rasterize the layer
+    rlayer = processing.run("gdal:rasterize", {
+        'INPUT': vlayer,
+        'FIELD': '', 'BURN': 99, 'USE_Z': False, 'UNITS': 1,
+        'WIDTH': pixel_size, 'HEIGHT': pixel_size,
+        'EXTENT': f'{extent_dict["ll_lon"]},{extent_dict["ur_lon"]},{extent_dict["ll_lat"]},{extent_dict["ur_lat"]} [EPSG:4326]',
+        'NODATA': 0,
+        'OPTIONS': '', 'DATA_TYPE': 0, 'INIT': 1, 'INVERT': False, 'EXTRA': '', 'OUTPUT': 'TEMPORARY_OUTPUT'})
+    return rlayer
 
-REPROJECT
+def sieve_raster(rlayer, pixel_size):
+    import math
+    import processing
+    nr_of_px_to_ignore = math.ceil(pixel_size/12.5)
 
-RASTERIZE
+    rlayer = processing.run("gdal:sieve", {
+        'INPUT': rlayer,
+        'THRESHOLD': nr_of_px_to_ignore,
+        'EIGHT_CONNECTEDNESS': False,
+        'NO_MASK': False, 'MASK_LAYER': None, 'EXTRA': '',
+        'OUTPUT': 'TEMPORARY_OUTPUT'})
 
-SIEVE
-processing.run("gdal:sieve", {'INPUT':'C:/Users/seise/AppData/Local/Temp/processing_ErCEMK/35b3a8b12611438aa4a64740b8e83675/OUTPUT.tif','THRESHOLD':10,'EIGHT_CONNECTEDNESS':False,'NO_MASK':False,'MASK_LAYER':None,'EXTRA':'','OUTPUT':'TEMPORARY_OUTPUT'})
-"""
+    return rlayer
 
+def nearest_neighbour(rlayer):
+    import processing
+    rlayer = processing.run("gdal:proximity", {
+        'INPUT': rlayer,
+        'BAND': 1, 'VALUES': '99', 'UNITS': 0, 'MAX_DISTANCE': 0, 'REPLACE': 0, 'NODATA': 0, 'OPTIONS': '', 'EXTRA': '',
+        'DATA_TYPE': 5, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+    return rlayer
 
+def normalize_rlayer(rlayer, type_):
+    import processing
+
+    print("start normalizing raster...")
+    rlayer = QgsRasterLayer(rlayer, type_)
+    provider = rlayer.dataProvider()
+
+    # get statistics for band 1
+    band = 1
+    stats = provider.bandStatistics(band, QgsRasterBandStats.All)
+    max_value = stats.maximumValue
+
+    # build normalization expression
+    expression = f'100/{max_value}*"{type_}@1"'
+    print(expression)
+
+    # normalize raster
+    rlayer = processing.run("native:rastercalc", {
+        'LAYERS': [rlayer],
+        'EXPRESSION': f'100/{max_value}*"{type_}@1"', 'EXTENT': None, 'CELL_SIZE': None, 'CRS': None,
+        'OUTPUT': 'TEMPORARY_OUTPUT'})
+
+    return rlayer
+
+def calculate_index(data):
+    import processing
+    print("start calculating the index ...")
+
+    # Build expression (Adding all the weighted raster cells) and dividing
+    base_string = '('
+    for key, value in data.items():
+        new_string = f'"{key}@1"*({value["WEIGHT"]}/100)+'
+        base_string += new_string
+    expr_string = base_string[:-1] + ')'+'/4'
+    print(expr_string)
+    # Todo max value is only 25
+
+    processing.runAndLoadResults("native:rastercalc", {
+        'LAYERS': [value["OUTPUT"] for value in data.values()],
+        'EXPRESSION': expr_string,
+        'EXTENT': None, 'CELL_SIZE': None, 'CRS': None, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+    pass
