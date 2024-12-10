@@ -215,7 +215,7 @@ class FlatFinder:
                 extent = self.dlg.mMapLayerComboBox.currentLayer().extent()
 
             # reproject the extent coordinates if not epsg 4326
-            extent_dict = reproject_extent(extent)
+            extent_dict, widened_extent_dict = reproject_extent(extent)
 
             # download OSM data based on extent
             for key, value in data.items():
@@ -225,7 +225,7 @@ class FlatFinder:
                     # get osm Features
                     vlayer = get_osm_features(
                         layer=key,
-                        extent_string=f"{extent_dict["ll_lat"]},{extent_dict["ll_lon"]},{extent_dict["ur_lat"]},{extent_dict["ur_lon"]}"
+                        extent_string=f"{widened_extent_dict["ll_lat"]},{widened_extent_dict["ll_lon"]},{widened_extent_dict["ur_lat"]},{widened_extent_dict["ur_lon"]}"
                     )
                 else:
                     vlayer = current_layer
@@ -236,13 +236,15 @@ class FlatFinder:
 
 
                 # rasterize for the nearest neighbour analysis
-                rlayer = rasterize_vlayer(vlayer["OUTPUT"], pixel_size, extent_dict)
+                rlayer = rasterize_vlayer(vlayer["OUTPUT"], pixel_size, widened_extent_dict)
 
                 if key == "leisureLayer" and current_layer is None:
                     rlayer = sieve_raster(rlayer["OUTPUT"], pixel_size)
 
                 rlayer = nearest_neighbour(rlayer["OUTPUT"])
+                rlayer = clip_to_extent(rlayer["OUTPUT"], extent_dict)
                 rlayer = normalize_rlayer(rlayer["OUTPUT"], type_=key)
+
 
                 # add final things to the dict - the output path of the normalized raster and the weight
                 data[key]["OUTPUT"] = QgsRasterLayer(rlayer["OUTPUT"], key)
@@ -257,6 +259,39 @@ class FlatFinder:
             print("FlatFinder finished...")
             print("---------------------------------------")
 
+def reproject_extent(extent):
+    # Get the source CRS
+    source_crs = QgsProject.instance().crs()
+    if hasattr(extent, 'sourceCrs'):
+        source_crs = extent.sourceCrs
+
+    # Define the target CRS (EPSG:4326)
+    target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+    transform = QgsCoordinateTransform(source_crs, target_crs, QgsProject.instance())
+
+    # Transform the extent coordinates
+    min_point = transform.transform(extent.xMinimum(), extent.yMinimum())
+    max_point = transform.transform(extent.xMaximum(), extent.yMaximum())
+
+    # Return the reprojected extent as a dictionary
+    extent_dict = {
+        "ll_lon": min_point.x(),
+        "ll_lat": min_point.y(),
+        "ur_lon": max_point.x(),
+        "ur_lat": max_point.y()
+    }
+
+    # to account for edge effects, the osm data needs to be downloaded for a bigger extent
+    widened_extent_dict = {
+        "ll_lon": min_point.x()-((max_point.x() - min_point.x())/2),
+        "ll_lat": min_point.y()-((max_point.y() - min_point.y())/2),
+        "ur_lon": max_point.x()+((max_point.x() - min_point.x())/2),
+        "ur_lat": max_point.y()+((max_point.y() - min_point.y())/2)
+    }
+
+    # print(extent_dict)
+    # print(widened_extent_dict)
+    return extent_dict, widened_extent_dict
 
 def get_osm_features(layer, extent_string):
     import processing
@@ -316,29 +351,6 @@ def get_osm_features(layer, extent_string):
         QgsProject.instance().addMapLayer(vlayer)
     return vlayer
 
-def reproject_extent(extent):
-    # Get the source CRS
-    source_crs = QgsProject.instance().crs()
-    if hasattr(extent, 'sourceCrs'):
-        source_crs = extent.sourceCrs
-
-    # Define the target CRS (EPSG:4326)
-    target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
-    transform = QgsCoordinateTransform(source_crs, target_crs, QgsProject.instance())
-
-    # Transform the extent coordinates
-    min_point = transform.transform(extent.xMinimum(), extent.yMinimum())
-    max_point = transform.transform(extent.xMaximum(), extent.yMaximum())
-
-    # Return the reprojected extent as a dictionary
-    extent_dict = {
-        "ll_lon": min_point.x(),
-        "ll_lat": min_point.y(),
-        "ur_lon": max_point.x(),
-        "ur_lat": max_point.y()
-    }
-    return extent_dict
-
 def reproject_vlayer(vlayer):
     import processing
 
@@ -384,6 +396,17 @@ def nearest_neighbour(rlayer):
         'INPUT': rlayer,
         'BAND': 1, 'VALUES': '99', 'UNITS': 0, 'MAX_DISTANCE': 0, 'REPLACE': 0, 'NODATA': 0, 'OPTIONS': '', 'EXTRA': '',
         'DATA_TYPE': 5, 'OUTPUT': 'TEMPORARY_OUTPUT'})
+    return rlayer
+
+def clip_to_extent(rlayer, extent_dict):
+    import processing
+
+    # as a bigger extent was used to account for edge effects, we can now return to the original extent
+    rlayer = processing.run("gdal:cliprasterbyextent", {
+        'INPUT': rlayer,
+        'PROJWIN': f'{extent_dict["ll_lon"]},{extent_dict["ur_lon"]},{extent_dict["ll_lat"]},{extent_dict["ur_lat"]} [EPSG:4326]',
+        'OVERCRS': False, 'NODATA': None, 'OPTIONS': '', 'DATA_TYPE': 0, 'EXTRA': '', 'OUTPUT': 'TEMPORARY_OUTPUT'})
+
     return rlayer
 
 def normalize_rlayer(rlayer, type_):
